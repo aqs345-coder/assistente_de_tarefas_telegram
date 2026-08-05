@@ -1,0 +1,16 @@
+# Ambiente virtual
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+
+# Segredos e configuracao local
+.env
+
+# Banco de dados e persistencia local
+*.db
+*.pickle
