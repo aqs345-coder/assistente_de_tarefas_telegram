@@ -1,5 +1,6 @@
 import logging
 import re
+import urllib.parse
 from datetime import date, datetime, time as dtime, timedelta
 
 from telegram import Update
@@ -13,6 +14,9 @@ from telegram.ext import (
     filters,
 )
 
+# Import do Twilio
+from twilio.rest import Client
+
 import config
 import db
 import web
@@ -22,7 +26,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TEXT, DURATION, TIME, CONFIRM = range(4)
+# Modificado para incluir a etapa URGENCY
+TEXT, DURATION, TIME, URGENCY, CONFIRM = range(5)
 CANCEL = 0
 
 START_TEXT = """Ola! Eu sou o assistente de tarefas.
@@ -36,15 +41,10 @@ Comandos disponiveis:
 Durante a criacao de um lembrete, use /cancelar a qualquer momento para abortar."""
 
 DURATION_UNITS = {
-    "dia": 1,
-    "dias": 1,
-    "semana": 7,
-    "semanas": 7,
-    "mes": 30,
-    "meses": 30,
-    "mês": 30,
-    "ano": 365,
-    "anos": 365,
+    "dia": 1, "dias": 1,
+    "semana": 7, "semanas": 7,
+    "mes": 30, "meses": 30, "mês": 30,
+    "ano": 365, "anos": 365,
 }
 
 TIME_PATTERN = re.compile(r"([01]?\d|2[0-3])\s*[:hH.]\s*([0-5]\d)\s*")
@@ -91,12 +91,37 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     reminder_id = job.data
     row = db.get_reminder(reminder_id)
+    
     if row is None or not row["active"]:
         job.schedule_removal()
         return
-    await context.bot.send_message(
-        chat_id=row["chat_id"], text=f"Lembrete: {row['text']}"
-    )
+        
+    # 1. Envia a mensagem padrão no Telegram
+    mensagem_alerta = f"Lembrete: {row['text']}"
+    await context.bot.send_message(chat_id=row["chat_id"], text=mensagem_alerta)
+    
+    # 2. Se for urgente, dispara a chamada pelo Twilio
+    # 2. Se for urgente, dispara a chamada pelo Twilio
+    if row["is_urgent"] == 1:
+        try:
+            # 1. URL do TwiML Bin
+            url_base_twiml = "https://handler.twilio.com/twiml/EHcfa0f1f90894f69dd171c6f3c5d68d83"
+            
+            # 2. Credenciais
+            client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
+            
+            logger.info(f"Disparando ligação de emergência para {config.DESTINATION_PHONE_NUMBER}.")
+                
+            client.calls.create(
+                url=url_base_twiml, 
+                to=config.DESTINATION_PHONE_NUMBER,
+                from_=config.TWILIO_PHONE_NUMBER
+            )
+            logger.info("Ligação enviada com sucesso para a operadora!")
+        except Exception as e:
+            logger.error(f"Erro ao tentar realizar a ligação via Twilio: {e}")
+            await context.bot.send_message(chat_id=row["chat_id"], text="⚠️ Tentei realizar a ligação, mas ocorreu um erro no sistema de voz.")
+    # 3. Lógica de remoção caso o período tenha acabado
     today = datetime.now(config.TIMEZONE).date()
     if today >= date.fromisoformat(row["end_date"]):
         db.deactivate_reminder(reminder_id)
@@ -132,7 +157,7 @@ async def meus_lembretes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [
         f"{r['id']}. {r['text']} - todos os dias as {r['time']} "
-        f"(ate {date.fromisoformat(r['end_date']).strftime('%d/%m/%Y')})"
+        f"(ate {date.fromisoformat(r['end_date']).strftime('%d/%m/%Y')}) {'📞' if r['is_urgent'] else ''}"
         for r in rows
     ]
     await update.effective_message.reply_text(
@@ -156,19 +181,14 @@ async def lembrete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receber_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
     if not text:
-        await update.effective_message.reply_text(
-            "A tarefa nao pode ser vazia. Envie a tarefa:"
-        )
+        await update.effective_message.reply_text("A tarefa nao pode ser vazia. Envie a tarefa:")
         return TEXT
     if len(text) > 200:
-        await update.effective_message.reply_text(
-            "Tarefa muito longa (maximo de 200 caracteres). Envie uma versao mais curta:"
-        )
+        await update.effective_message.reply_text("Tarefa muito longa (maximo de 200 caracteres). Envie uma versao mais curta:")
         return TEXT
     context.user_data["reminder_text"] = text
     await update.effective_message.reply_text(
-        "Por quanto tempo o lembrete deve ficar ativo? "
-        "(ex: 3 semanas, 15 dias, 1 mes, ou apenas um numero de dias)"
+        "Por quanto tempo o lembrete deve ficar ativo? (ex: 3 semanas, 15 dias, 1 mes, ou apenas um numero de dias)"
     )
     return DURATION
 
@@ -177,8 +197,7 @@ async def receber_duracao(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days = parse_duration(update.effective_message.text)
     if days is None:
         await update.effective_message.reply_text(
-            "Duracao invalida. Use formatos como '3 semanas', '10 dias', '1 mes' "
-            "ou apenas um numero de dias."
+            "Duracao invalida. Use formatos como '3 semanas', '10 dias', '1 mes' ou apenas um numero de dias."
         )
         return DURATION
     context.user_data["duration_days"] = days
@@ -196,15 +215,37 @@ async def receber_horario(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return TIME
     context.user_data["reminder_time"] = horario
+    
+    await update.effective_message.reply_text(
+        "Este lembrete é URGENTE e deve realizar uma ligação telefônica para acordar/avisar você?\n\n"
+        "Envie 'sim' para fazer ligação telefônica ou 'nao' para apenas notificar no Telegram."
+    )
+    return URGENCY
+
+# --- NOVA ETAPA: URGÊNCIA ---
+async def receber_urgencia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.effective_message.text.strip().lower()
+    if answer not in ("sim", "nao"):
+        await update.effective_message.reply_text("Envie 'sim' para ativar a ligação ou 'nao' para manter apenas texto.")
+        return URGENCY
+    
+    is_urgent = 1 if answer == "sim" else 0
+    context.user_data["is_urgent"] = is_urgent
+    
     text = context.user_data["reminder_text"]
     days = context.user_data["duration_days"]
+    horario = context.user_data["reminder_time"]
     end = datetime.now(config.TIMEZONE).date() + timedelta(days=days)
+    
+    ligacao_texto = "SIM 📞" if is_urgent else "NÃO 💬"
+    
     message = (
         "Confirma o lembrete?\n\n"
         f"Tarefa: {text}\n"
         "Frequencia: todos os dias\n"
         f"Horario: {horario.strftime('%H:%M')}\n"
-        f"Duracao: {days} dia(s), ate {end.strftime('%d/%m/%Y')}\n\n"
+        f"Duracao: {days} dia(s), ate {end.strftime('%d/%m/%Y')}\n"
+        f"Fazer Ligação: {ligacao_texto}\n\n"
         "Envie 'sim' para confirmar ou 'nao' para cancelar."
     )
     await update.effective_message.reply_text(message)
@@ -231,8 +272,11 @@ async def criar_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = context.user_data["reminder_text"]
     days = context.user_data["duration_days"]
     horario = context.user_data["reminder_time"]
+    is_urgent = context.user_data["is_urgent"]
+    
     today = datetime.now(config.TIMEZONE).date()
     end = today + timedelta(days=days)
+    
     reminder_id = db.add_reminder(
         update.effective_user.id,
         update.effective_chat.id,
@@ -240,8 +284,11 @@ async def criar_lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today.isoformat(),
         end.isoformat(),
         horario.strftime("%H:%M"),
+        is_urgent # Novo campo adicionado
     )
+    
     schedule_reminder(context.job_queue, reminder_id, config.TIMEZONE)
+    
     await update.effective_message.reply_text(
         "Lembrete criado!\n\n"
         f"'{text}'\n"
@@ -302,6 +349,7 @@ def build_application():
             TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_texto)],
             DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_duracao)],
             TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_horario)],
+            URGENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receber_urgencia)], # Adicionado o handler de urgencia
             CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirmar)],
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
@@ -343,6 +391,8 @@ def main():
         raise SystemExit(1)
     db.init_db()
     application = build_application()
+    
+    # Inicia o servidor HTTP (utilizado pela sua hospedagem)
     httpd = web.start_http_server(config.PORT)
     logger.info("Bot iniciado. Pressione Ctrl+C para parar.")
     try:
